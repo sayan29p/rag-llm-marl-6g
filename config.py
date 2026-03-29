@@ -87,7 +87,7 @@ ACTIVE_LLM_MODEL   = GROQ_MODEL if USE_GROQ else LLM_MODEL_OPENAI
 # -----------------------------------------------------------------------------
 # Training
 # -----------------------------------------------------------------------------
-TOTAL_STEPS        = 500_000  # Total environment interaction steps
+TOTAL_STEPS        = 200_000  # Total environment interaction steps
 
 # -----------------------------------------------------------------------------
 # Filesystem Paths

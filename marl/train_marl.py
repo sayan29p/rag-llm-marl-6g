@@ -476,19 +476,19 @@ def train(seed: int = 42):
             )
 
         # -----------------------------------------------------------------
-        # Step 11: Early stopping — no improvement over last EARLY_STOP_WINDOW steps
+        # Step 11: Early stopping — disabled
         # -----------------------------------------------------------------
-        if step >= 100_000 and step >= EARLY_STOP_WINDOW * 2 and step % EARLY_STOP_WINDOW == 0:
-            old_mean = float(np.mean(step_latencies[-2 * EARLY_STOP_WINDOW : -EARLY_STOP_WINDOW]))
-            new_mean = float(np.mean(step_latencies[-EARLY_STOP_WINDOW:]))
-            # Latency decreasing means improvement; check relative change
-            if old_mean > 0 and (old_mean - new_mean) / old_mean < EARLY_STOP_MIN_IMPV:
-                print(
-                    f"Early stopping at step {step:,}: latency improvement "
-                    f"({(old_mean-new_mean)/old_mean*100:.2f}%) below "
-                    f"{EARLY_STOP_MIN_IMPV*100:.0f}% threshold."
-                )
-                break
+        # if step >= 100_000 and step >= EARLY_STOP_WINDOW * 2 and step % EARLY_STOP_WINDOW == 0:
+        #     old_mean = float(np.mean(step_latencies[-2 * EARLY_STOP_WINDOW : -EARLY_STOP_WINDOW]))
+        #     new_mean = float(np.mean(step_latencies[-EARLY_STOP_WINDOW:]))
+        #     # Latency decreasing means improvement; check relative change
+        #     if old_mean > 0 and (old_mean - new_mean) / old_mean < EARLY_STOP_MIN_IMPV:
+        #         print(
+        #             f"Early stopping at step {step:,}: latency improvement "
+        #             f"({(old_mean-new_mean)/old_mean*100:.2f}%) below "
+        #             f"{EARLY_STOP_MIN_IMPV*100:.0f}% threshold."
+        #         )
+        #         break
 
         # -----------------------------------------------------------------
         # Step 12: Convergence detection
