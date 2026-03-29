@@ -278,17 +278,23 @@ class EdgeCloudEnv(gym.Env):
         self.cloud_queue = max(0.0, self.cloud_queue - K * 0.1)
 
         # ------------------------------------------------------------------
-        # Reward  r = -(W1 * mean_latency + W2 * mean_energy + W3 * mean_sla)
-        # Dinur energy ~0.01-0.1 J is already comparable to latency in seconds;
-        # no scaling needed.
+        # Reward  r = -(W1*mean_latency + W2*mean_energy*ENERGY_SCALE + W3*mean_sla)
+        #
+        # The Dinur model (e = κ·f²·C) is calibrated for IoT devices (~MHz).
+        # At edge/cloud server frequencies (GHz) it produces 10–400 J per task,
+        # which would overwhelm the latency signal (0.1–2 s).  ENERGY_SCALE
+        # corrects for this so all three terms contribute comparably to the reward.
+        # Target reward range: −1 to −5.
         # ------------------------------------------------------------------
+        ENERGY_SCALE = 1e-2   # brings GHz-server Dinur energy (10–400 J) into ~0.1–4 J effective range
+
         mean_latency  = float(np.mean(latencies))
         mean_energy   = float(np.mean(energies))
         mean_sla      = float(np.mean(sla_violations))
 
         reward = -(
             W1 * mean_latency +
-            W2 * mean_energy +
+            W2 * mean_energy * ENERGY_SCALE +
             W3 * mean_sla
         )
 

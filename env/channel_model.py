@@ -125,9 +125,14 @@ class ChannelModel:
 
         where B[k,m] is the allocated bandwidth in Hz.
 
+        A minimum floor of 1 Mbps is enforced so that deep Rayleigh fades
+        (H → 0, SNR → 0) do not produce near-zero rates, which would cause
+        transmission delays of thousands of seconds and blow up the reward.
+
         Returns shape (K, M) in bps.
         """
-        return self.bandwidth * np.log2(1.0 + self.SNR)            # (K, M)  bps
+        raw = self.bandwidth * np.log2(1.0 + self.SNR)             # (K, M)  bps
+        return np.maximum(raw, 1e6)                                 # floor: 1 Mbps
 
     # ------------------------------------------------------------------
     # Public API
