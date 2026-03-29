@@ -101,8 +101,8 @@ def collect_experience(env, agents, obs):
     Returns
     -------
     obs        : np.ndarray  — observation used this step  (same as input)
-    actions    : list[int]   — one sampled action per agent (length M)
-    log_probs  : list[float] — log π(a|s) per agent        (length M)
+    actions    : list[int]   — mean action index per agent (length M), for PPO storage
+    log_probs  : list[float] — mean log π(a|s) across K samples per agent (length M)
     values     : list[float] — V(s) per agent              (length M)
     reward     : float       — base environment reward
     next_obs   : np.ndarray
@@ -118,15 +118,23 @@ def collect_experience(env, agents, obs):
 
     with torch.no_grad():
         for agent in agents:
-            action, log_prob = agent.act(obs_tensor)
+            # Sample K independent actions — one routing decision per device
+            k_actions   = []
+            k_log_probs = []
+            for _ in range(K):
+                a, lp = agent.act(obs_tensor)
+                k_actions.append(int(a.item()))
+                k_log_probs.append(float(lp.item()))
             value = agent.critic(obs_tensor.to(agent.device))
-            actions.append(int(action.item()))
-            log_probs.append(float(log_prob.item()))
+
+            # Store mean action/log_prob for PPO update (scalar per agent)
+            actions.append(int(round(float(np.mean(k_actions)))))
+            log_probs.append(float(np.mean(k_log_probs)))
             values.append(float(value.item()))
 
-    # Each agent's single action is broadcast to all K device slots
+    # Each agent sends K independent per-device routing decisions to the env
     joint_action = tuple(
-        np.full(K, actions[i], dtype=np.int32)
+        np.array([agents[i].act(obs_tensor)[0].item() for _ in range(K)], dtype=np.int32)
         for i in range(M)
     )
 
