@@ -404,12 +404,16 @@ def train(seed: int = 42):
         # Step 8: Progress logging
         # -----------------------------------------------------------------
         if step % EVAL_INTERVAL == 0:
-            recent_ep_rewards = episode_rewards[-20:] if episode_rewards else [ep_reward_accum]
+            mean_step_reward = (
+                float(np.mean(buffer["rewards"][-EVAL_INTERVAL:]))
+                if len(buffer["rewards"]) >= EVAL_INTERVAL
+                else base_reward
+            )
             win = slice(-EVAL_INTERVAL, None)
 
             print(
                 f"step {step:>8,} | "
-                f"reward {np.mean(recent_ep_rewards):+.4f} | "
+                f"mean_step_reward {mean_step_reward:+.4f} | "
                 f"latency {np.mean(step_latencies[win]):.4f}s | "
                 f"energy {np.mean(step_energies[win]):.4e}J | "
                 f"SLA viol {np.mean(step_sla[win]):.4f}s | "
