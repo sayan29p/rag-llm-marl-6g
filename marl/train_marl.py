@@ -283,6 +283,26 @@ def train(seed: int = 42):
 
     current_hint: dict | None = None   # most recently computed LLM hint
 
+    # -----------------------------------------------------------------
+    # Early stopping / best-model tracking
+    # -----------------------------------------------------------------
+    PROGRESS_INTERVAL   = 10_000   # steps between progress-bar prints
+    EARLY_STOP_WINDOW   = 10_000   # steps to look back for improvement check
+    EARLY_STOP_MIN_IMPV = 0.01     # minimum 1% improvement required
+    CONVERGE_WINDOW     = 5_000    # steps to average for convergence check
+    CONVERGE_THRESHOLD  = -5.0     # mean reward above this → converged
+
+    best_reward     = -float("inf")
+    best_models_dir = os.path.join(MODELS_DIR, "best")
+    os.makedirs(best_models_dir, exist_ok=True)
+
+    def _save_best():
+        for i, agent in enumerate(agents):
+            torch.save(
+                {"actor": agent.actor.state_dict(), "critic": agent.critic.state_dict()},
+                os.path.join(best_models_dir, f"agent_{i}.pt"),
+            )
+
     device = agents[0].device
     print(
         f"Training start | total_steps={TOTAL_STEPS:,} | "
@@ -395,6 +415,61 @@ def train(seed: int = 42):
                 f"RAG {len(vector_store):,} | "
                 f"elapsed {time.time() - t0:.0f}s"
             )
+
+        # -----------------------------------------------------------------
+        # Step 9: Best-model saving
+        # -----------------------------------------------------------------
+        if len(step_latencies) >= EVAL_INTERVAL:
+            current_mean_reward = float(np.mean(
+                episode_rewards[-20:] if episode_rewards else [ep_reward_accum]
+            ))
+            if current_mean_reward > best_reward:
+                best_reward = current_mean_reward
+                _save_best()
+
+        # -----------------------------------------------------------------
+        # Step 10: Progress bar (every PROGRESS_INTERVAL steps)
+        # -----------------------------------------------------------------
+        if step % PROGRESS_INTERVAL == 0:
+            pct      = 100.0 * step / TOTAL_STEPS
+            bar_len  = 30
+            filled   = int(bar_len * step / TOTAL_STEPS)
+            bar      = "█" * filled + "░" * (bar_len - filled)
+            elapsed  = time.time() - t0
+            eta      = (elapsed / step) * (TOTAL_STEPS - step)
+            print(f"[{bar}] {pct:5.1f}%  step {step:,}/{TOTAL_STEPS:,}  "
+                  f"best_reward={best_reward:+.4f}  "
+                  f"ETA {eta/60:.1f}min")
+
+        # -----------------------------------------------------------------
+        # Step 11: Early stopping — no improvement over last EARLY_STOP_WINDOW steps
+        # -----------------------------------------------------------------
+        if step >= EARLY_STOP_WINDOW * 2 and step % EARLY_STOP_WINDOW == 0:
+            old_mean = float(np.mean(step_latencies[-2 * EARLY_STOP_WINDOW : -EARLY_STOP_WINDOW]))
+            new_mean = float(np.mean(step_latencies[-EARLY_STOP_WINDOW:]))
+            # Latency decreasing means improvement; check relative change
+            if old_mean > 0 and (old_mean - new_mean) / old_mean < EARLY_STOP_MIN_IMPV:
+                print(
+                    f"Early stopping at step {step:,}: latency improvement "
+                    f"({(old_mean-new_mean)/old_mean*100:.2f}%) below "
+                    f"{EARLY_STOP_MIN_IMPV*100:.0f}% threshold."
+                )
+                break
+
+        # -----------------------------------------------------------------
+        # Step 12: Convergence detection
+        # -----------------------------------------------------------------
+        if len(step_latencies) >= CONVERGE_WINDOW:
+            recent_rewards_conv = (
+                episode_rewards[-50:] if len(episode_rewards) >= 50
+                else episode_rewards or [ep_reward_accum]
+            )
+            if float(np.mean(recent_rewards_conv)) > CONVERGE_THRESHOLD:
+                print(
+                    f"CONVERGED at step {step:,}: mean reward "
+                    f"{np.mean(recent_rewards_conv):+.4f} > {CONVERGE_THRESHOLD}"
+                )
+                break
 
     # -----------------------------------------------------------------
     # Save final model checkpoints
