@@ -1,0 +1,5 @@
+baseline,mean_latency_s,mean_energy_J,mean_sla_violation_s
+Random,2.886238,1.212716e+01,2.538352
+Greedy,1.400557,6.177390e+00,1.087252
+MARL only,,,
+Full system,,,

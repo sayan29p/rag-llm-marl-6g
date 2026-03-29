@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(py -3.10 --version)",
+      "Bash(py -3.11 --version)",
+      "Bash(py -3.12 --version)",
+      "Bash(py --list)",
+      "Bash(py -3.11 -m pip install \"openai>=1.0.0\")",
+      "Bash(py:*)",
+      "Bash(where python3.11)",
+      "Bash(conda env:*)",
+      "Bash(conda run:*)",
+      "Bash(\"/c/ProgramData/anaconda3/python.exe\" -c \"import torch; print\\(''torch'', torch.__version__\\)\")",
+      "Bash(\"/c/ProgramData/anaconda3/python.exe\" --version)"
+    ]
+  }
+}
