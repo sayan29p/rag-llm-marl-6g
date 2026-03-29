@@ -253,6 +253,8 @@ def train(seed: int = 42):
     Every BATCH_SIZE steps     : PPO update for all agents.
     Every EVAL_INTERVAL steps  : print progress metrics.
     """
+    N_COORD = 999_999  # set to N_COORDINATION to re-enable LLM coordination
+
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR,  exist_ok=True)
     os.makedirs(LOGS_DIR,    exist_ok=True)
@@ -305,9 +307,9 @@ def train(seed: int = 42):
         embedding  = embedder.embed(state_text)
 
         # -----------------------------------------------------------------
-        # Step 3: LLM coordination every N_COORDINATION steps
+        # Step 3: LLM coordination every N_COORD steps
         # -----------------------------------------------------------------
-        if step % N_COORDINATION == 0:
+        if step % N_COORD == 0:
             if len(vector_store) > 0:
                 results        = vector_store.retrieve(embedding, top_k=RAG_TOP_K)
                 context_string = vector_store.build_context_string(results)
