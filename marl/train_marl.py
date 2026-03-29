@@ -280,6 +280,7 @@ def train(seed: int = 42):
     step_latencies   = []   # per-step mean latency
     step_energies    = []   # per-step mean energy
     step_sla         = []   # per-step mean SLA violation
+    reward_history   = []   # mean reward snapshot every 1 000 steps
 
     current_hint: dict | None = None   # most recently computed LLM hint
 
@@ -428,18 +429,47 @@ def train(seed: int = 42):
                 _save_best()
 
         # -----------------------------------------------------------------
-        # Step 10: Progress bar (every PROGRESS_INTERVAL steps)
+        # Step 10: reward_history snapshot + progress bar + trend report
         # -----------------------------------------------------------------
+        if step % 1_000 == 0:
+            snapshot = float(np.mean(
+                episode_rewards[-20:] if episode_rewards else [ep_reward_accum]
+            ))
+            reward_history.append(snapshot)
+
         if step % PROGRESS_INTERVAL == 0:
-            pct      = 100.0 * step / TOTAL_STEPS
-            bar_len  = 30
-            filled   = int(bar_len * step / TOTAL_STEPS)
-            bar      = "█" * filled + "░" * (bar_len - filled)
-            elapsed  = time.time() - t0
-            eta      = (elapsed / step) * (TOTAL_STEPS - step)
-            print(f"[{bar}] {pct:5.1f}%  step {step:,}/{TOTAL_STEPS:,}  "
-                  f"best_reward={best_reward:+.4f}  "
-                  f"ETA {eta/60:.1f}min")
+            pct     = 100.0 * step / TOTAL_STEPS
+            bar_len = 30
+            filled  = int(bar_len * step / TOTAL_STEPS)
+            bar     = "█" * filled + "░" * (bar_len - filled)
+            elapsed = time.time() - t0
+            eta     = (elapsed / step) * (TOTAL_STEPS - step)
+
+            last_1k = reward_history[-1] if reward_history else ep_reward_accum
+
+            # Trend: compare the most-recent 1 000-step snapshot to the one
+            # 10 snapshots earlier (= 10 000 steps ago) when available.
+            if len(reward_history) >= 11:
+                delta = reward_history[-1] - reward_history[-11]
+                if delta > 0.05:
+                    trend = "IMPROVING"
+                elif delta < -0.05:
+                    trend = "DEGRADING"
+                else:
+                    trend = "STABLE"
+            else:
+                trend = "STABLE"
+
+            print(
+                f"[{bar}] {pct:5.1f}%  step {step:,}/{TOTAL_STEPS:,}  "
+                f"ETA {eta/60:.1f}min"
+            )
+            print(
+                f"Progress: {pct:.0f}% | "
+                f"Best reward: {best_reward:+.4f} | "
+                f"Last 1000 mean: {last_1k:+.4f} | "
+                f"Trend: {trend}"
+            )
 
         # -----------------------------------------------------------------
         # Step 11: Early stopping — no improvement over last EARLY_STOP_WINDOW steps
