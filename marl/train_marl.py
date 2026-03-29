@@ -288,10 +288,10 @@ def train(seed: int = 42):
     # Early stopping / best-model tracking
     # -----------------------------------------------------------------
     PROGRESS_INTERVAL   = 10_000   # steps between progress-bar prints
-    EARLY_STOP_WINDOW   = 10_000   # steps to look back for improvement check
-    EARLY_STOP_MIN_IMPV = 0.01     # minimum 1% improvement required
+    EARLY_STOP_WINDOW   = 50_000   # steps to look back for improvement check
+    EARLY_STOP_MIN_IMPV = 0.001    # minimum 0.1% improvement required
     CONVERGE_WINDOW     = 5_000    # steps to average for convergence check
-    CONVERGE_THRESHOLD  = -5.0     # mean reward above this → converged
+    CONVERGE_THRESHOLD  = -0.3     # mean reward above this → converged
 
     best_reward     = -float("inf")
     best_models_dir = os.path.join(MODELS_DIR, "best")
@@ -478,7 +478,7 @@ def train(seed: int = 42):
         # -----------------------------------------------------------------
         # Step 11: Early stopping — no improvement over last EARLY_STOP_WINDOW steps
         # -----------------------------------------------------------------
-        if step >= EARLY_STOP_WINDOW * 2 and step % EARLY_STOP_WINDOW == 0:
+        if step >= 100_000 and step >= EARLY_STOP_WINDOW * 2 and step % EARLY_STOP_WINDOW == 0:
             old_mean = float(np.mean(step_latencies[-2 * EARLY_STOP_WINDOW : -EARLY_STOP_WINDOW]))
             new_mean = float(np.mean(step_latencies[-EARLY_STOP_WINDOW:]))
             # Latency decreasing means improvement; check relative change
