@@ -253,7 +253,7 @@ def train(seed: int = 42):
     Every BATCH_SIZE steps     : PPO update for all agents.
     Every EVAL_INTERVAL steps  : print progress metrics.
     """
-    N_COORD = 999_999  # set to N_COORDINATION to re-enable LLM coordination
+    N_COORD = N_COORDINATION  # fires every 10 steps as configured in config.py
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR,  exist_ok=True)
