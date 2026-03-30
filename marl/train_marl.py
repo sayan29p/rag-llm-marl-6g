@@ -233,9 +233,6 @@ def ppo_update(shared_agent, buffer, step: int = 0):
     acts_flat   = np.array(buffer["actions"],   dtype=np.int64).flatten()   # (T*K,)
     old_lp_flat = np.array(buffer["log_probs"], dtype=np.float32).flatten() # (T*K,)
 
-    # Normalise returns for critic stability
-    ret_flat = (ret_flat - ret_flat.mean()) / (ret_flat.std() + 1e-8)
-
     # Normalise advantages over the full T*K batch
     adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
