@@ -1,6 +1,6 @@
 # =============================================================================
 # RAG-Enhanced LLM-Coordinated MARL for 6G Edge-Cloud Task Offloading
-# Hierarchical training loop — wires together all system components
+# Hierarchical training loop — parameter-sharing MARL
 # =============================================================================
 
 import os
@@ -53,10 +53,14 @@ def setup(seed: int = 42):
     """
     Instantiate and return all system components.
 
+    Parameter-sharing MARL: a single shared_agent network is used by all
+    M edge nodes and all K devices.  All agents share weights; only the
+    global observation differs between time steps.
+
     Returns
     -------
     env          : EdgeCloudEnv
-    agents       : list[MAPPOAgent]  — length M
+    shared_agent : MAPPOAgent  — one network shared across all agents
     serializer   : StateSerializer
     embedder     : StateEmbedder
     vector_store : VectorStore
@@ -65,11 +69,8 @@ def setup(seed: int = 42):
     """
     env = EdgeCloudEnv(seed=seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    agents = [
-        MAPPOAgent(obs_dim=OBS_DIM, n_actions=N_ACTIONS_PER_DEVICE, device=device)
-        for _ in range(M)
-    ]
+    device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    shared_agent = MAPPOAgent(obs_dim=OBS_DIM, n_actions=N_ACTIONS_PER_DEVICE, device=device)
 
     serializer   = StateSerializer()
     embedder     = StateEmbedder()
@@ -77,70 +78,61 @@ def setup(seed: int = 42):
     coordinator  = LLMCoordinator()
     hint_parser  = HintParser()
 
-    return env, agents, serializer, embedder, vector_store, coordinator, hint_parser
+    return env, shared_agent, serializer, embedder, vector_store, coordinator, hint_parser
 
 
 # =============================================================================
 # 2.  collect_experience()
 # =============================================================================
 
-def collect_experience(env, agents, obs):
+def collect_experience(env, shared_agent, obs):
     """
-    Execute one environment step using all M agents.
+    Execute one environment step using the shared policy.
 
-    Each agent sees the shared global observation and independently selects
-    one discrete action (which destination to route tasks to).  That action
-    is replicated across all K devices for the env step.
+    The shared_agent is called K times — once per IoT device — to produce
+    K independent routing decisions.  All M edge nodes receive the same
+    K-length action array (parameter sharing: one policy for all nodes).
 
     Parameters
     ----------
-    env    : EdgeCloudEnv
-    agents : list[MAPPOAgent], length M
-    obs    : np.ndarray, shape (OBS_DIM,)
+    env          : EdgeCloudEnv
+    shared_agent : MAPPOAgent
+    obs          : np.ndarray, shape (OBS_DIM,)
 
     Returns
     -------
-    obs        : np.ndarray  — observation used this step  (same as input)
-    actions    : list[int]   — mean action index per agent (length M), for PPO storage
-    log_probs  : list[float] — mean log π(a|s) across K samples per agent (length M)
-    values     : list[float] — V(s) per agent              (length M)
-    reward     : float       — base environment reward
-    next_obs   : np.ndarray
-    terminated : bool
-    truncated  : bool
-    info       : dict  {mean_latency, mean_energy, mean_sla_violation, ...}
+    obs            : np.ndarray  — observation used this step (same as input)
+    device_actions : list[int]   — K sampled actions, one per device
+    device_lps     : list[float] — K log π(a|s) values
+    value          : float       — V(obs) from critic
+    reward         : float       — base environment reward
+    next_obs       : np.ndarray
+    terminated     : bool
+    truncated      : bool
+    info           : dict  {mean_latency, mean_energy, mean_sla_violation, ...}
     """
     obs_tensor = torch.tensor(obs, dtype=torch.float32)
 
-    actions   = []
-    log_probs = []
-    values    = []
+    device_actions = []
+    device_lps     = []
 
     with torch.no_grad():
-        for agent in agents:
-            # Sample K independent actions — one routing decision per device
-            k_actions   = []
-            k_log_probs = []
-            for _ in range(K):
-                a, lp = agent.act(obs_tensor)
-                k_actions.append(int(a.item()))
-                k_log_probs.append(float(lp.item()))
-            value = agent.critic(obs_tensor.to(agent.device))
+        # K independent action samples — one routing decision per IoT device
+        for _ in range(K):
+            a, lp = shared_agent.act(obs_tensor)
+            device_actions.append(int(a.item()))
+            device_lps.append(float(lp.item()))
 
-            # Store mean action/log_prob for PPO update (scalar per agent)
-            actions.append(int(round(float(np.mean(k_actions)))))
-            log_probs.append(float(np.mean(k_log_probs)))
-            values.append(float(value.item()))
+        value = float(shared_agent.critic(obs_tensor.to(shared_agent.device)).item())
 
-    # Each agent sends K independent per-device routing decisions to the env
+    # All M edge nodes use the same K-device routing decisions (parameter sharing)
     joint_action = tuple(
-        np.array([agents[i].act(obs_tensor)[0].item() for _ in range(K)], dtype=np.int32)
-        for i in range(M)
+        np.array(device_actions, dtype=np.int32) for _ in range(M)
     )
 
     next_obs, reward, terminated, truncated, info = env.step(joint_action)
 
-    return obs, actions, log_probs, values, float(reward), next_obs, terminated, truncated, info
+    return obs, device_actions, device_lps, value, float(reward), next_obs, terminated, truncated, info
 
 
 # =============================================================================
@@ -154,7 +146,7 @@ def compute_returns_and_advantages(rewards, values, last_value, gamma=GAMMA, lam
     Parameters
     ----------
     rewards    : list[float], length T
-    values     : list[float], length T  — V(s_t) estimates (mean over agents)
+    values     : list[float], length T  — V(s_t) from shared critic
     last_value : float                  — V(s_{T+1}) bootstrap
     gamma      : float                  — discount factor
     lam        : float                  — GAE lambda
@@ -185,67 +177,72 @@ def compute_returns_and_advantages(rewards, values, last_value, gamma=GAMMA, lam
 # 4.  ppo_update()
 # =============================================================================
 
-def ppo_update(agents, buffer):
+def ppo_update(shared_agent, buffer):
     """
-    Run PPO parameter updates for all M agents on the collected buffer.
+    Run PPO parameter update for the single shared_agent.
 
-    Uses clipped surrogate objective + MSE critic loss + entropy bonus.
+    Buffer stores K actions and K log_probs per environment step.
+    We flatten to T*K transitions so the shared network is trained on
+    every individual device decision, not just step-level averages.
 
     Parameters
     ----------
-    agents : list[MAPPOAgent]
+    shared_agent : MAPPOAgent
     buffer : dict with keys
-        obs        : list[np.ndarray(OBS_DIM,)]
-        actions    : list[list[int]]              — shape (T, M)
-        log_probs  : list[list[float]]            — shape (T, M)
-        returns    : list[float]                  — shape (T,)
-        advantages : list[float]                  — shape (T,)
+        obs        : list[np.ndarray(OBS_DIM,)]   — length T
+        actions    : list[list[int]]              — shape (T, K)
+        log_probs  : list[list[float]]            — shape (T, K)
+        returns    : list[float]                  — length T
+        advantages : list[float]                  — length T
     """
-    obs_arr  = np.array(buffer["obs"],       dtype=np.float32)  # (T, OBS_DIM)
-    ret_arr  = np.array(buffer["returns"],   dtype=np.float32)  # (T,)
-    adv_arr  = np.array(buffer["advantages"],dtype=np.float32)  # (T,)
+    T = len(buffer["obs"])
 
-    # Normalise advantages over the whole batch
-    adv_arr = (adv_arr - adv_arr.mean()) / (adv_arr.std() + 1e-8)
+    obs_arr = np.array(buffer["obs"], dtype=np.float32)        # (T, OBS_DIM)
+    ret_arr = np.array(buffer["returns"],    dtype=np.float32)  # (T,)
+    adv_arr = np.array(buffer["advantages"], dtype=np.float32)  # (T,)
 
-    for agent_idx, agent in enumerate(agents):
-        acts_arr   = np.array(
-            [a[agent_idx]  for a in buffer["actions"]],   dtype=np.int64
-        )                                                          # (T,)
-        old_lp_arr = np.array(
-            [lp[agent_idx] for lp in buffer["log_probs"]], dtype=np.float32
-        )                                                          # (T,)
+    # Flatten T steps × K devices → T*K effective transitions
+    # Each device in a step shares the same obs, return, and advantage
+    obs_flat    = np.repeat(obs_arr, K, axis=0)                 # (T*K, OBS_DIM)
+    ret_flat    = np.repeat(ret_arr, K)                         # (T*K,)
+    adv_flat    = np.repeat(adv_arr, K)                         # (T*K,)
+    acts_flat   = np.array(buffer["actions"],   dtype=np.int64).flatten()   # (T*K,)
+    old_lp_flat = np.array(buffer["log_probs"], dtype=np.float32).flatten() # (T*K,)
 
-        obs_t    = torch.tensor(obs_arr,    device=agent.device)
-        acts_t   = torch.tensor(acts_arr,   device=agent.device)
-        old_lp_t = torch.tensor(old_lp_arr, device=agent.device)
-        ret_t    = torch.tensor(ret_arr,    device=agent.device)
-        adv_t    = torch.tensor(adv_arr,    device=agent.device)
+    # Normalise advantages over the full T*K batch
+    adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
-        for _ in range(PPO_EPOCHS):
-            values_t, new_lp_t, entropy = agent.evaluate(obs_t, acts_t)
-            values_t = values_t.squeeze(-1)                        # (T,)
+    dev = shared_agent.device
+    obs_t    = torch.tensor(obs_flat,    device=dev)
+    acts_t   = torch.tensor(acts_flat,   device=dev)
+    old_lp_t = torch.tensor(old_lp_flat, device=dev)
+    ret_t    = torch.tensor(ret_flat,    device=dev)
+    adv_t    = torch.tensor(adv_flat,    device=dev)
 
-            # Importance-sampling ratio  π_new / π_old
-            ratio      = torch.exp(new_lp_t - old_lp_t)
-            clip_ratio = torch.clamp(ratio, 1.0 - PPO_EPSILON, 1.0 + PPO_EPSILON)
+    for _ in range(PPO_EPOCHS):
+        values_t, new_lp_t, entropy = shared_agent.evaluate(obs_t, acts_t)
+        values_t = values_t.squeeze(-1)                         # (T*K,)
 
-            # Actor loss: clipped surrogate objective (maximised → negated)
-            actor_loss  = -torch.min(ratio * adv_t, clip_ratio * adv_t).mean()
+        # Importance-sampling ratio  π_new / π_old
+        ratio      = torch.exp(new_lp_t - old_lp_t)
+        clip_ratio = torch.clamp(ratio, 1.0 - PPO_EPSILON, 1.0 + PPO_EPSILON)
 
-            # Critic loss: mean-squared TD error
-            critic_loss = F.mse_loss(values_t, ret_t)
+        # Actor loss: clipped surrogate objective (maximised → negated)
+        actor_loss  = -torch.min(ratio * adv_t, clip_ratio * adv_t).mean()
 
-            # Combined loss with entropy bonus to encourage exploration
-            loss = actor_loss + CRITIC_COEF * critic_loss - ENTROPY_COEF * entropy
+        # Critic loss: mean-squared TD error
+        critic_loss = F.mse_loss(values_t, ret_t)
 
-            agent.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(agent.actor.parameters()) + list(agent.critic.parameters()),
-                max_norm=GRAD_CLIP,
-            )
-            agent.optimizer.step()
+        # Combined loss with entropy bonus to encourage exploration
+        loss = actor_loss + CRITIC_COEF * critic_loss - ENTROPY_COEF * entropy
+
+        shared_agent.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(shared_agent.actor.parameters()) + list(shared_agent.critic.parameters()),
+            max_norm=GRAD_CLIP,
+        )
+        shared_agent.optimizer.step()
 
 
 # =============================================================================
@@ -256,18 +253,18 @@ def train(seed: int = 42):
     """
     Full hierarchical training loop.
 
-    Every step       : collect one transition; store in RAG vector store.
-    Every N_COORDINATION steps : query LLM coordinator; shape reward.
-    Every BATCH_SIZE steps     : PPO update for all agents.
-    Every EVAL_INTERVAL steps  : print progress metrics.
+    Every step              : collect one transition; store in RAG vector store.
+    Every N_COORD steps     : query LLM coordinator; shape reward.
+    Every BATCH_SIZE steps  : PPO update on shared_agent (T*K transitions).
+    Every EVAL_INTERVAL     : print progress metrics.
     """
-    N_COORD = 999_999  # fires every 10 steps as configured in config.py
+    N_COORD = N_COORDINATION  # fires every 10 steps as configured in config.py
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR,  exist_ok=True)
     os.makedirs(LOGS_DIR,    exist_ok=True)
 
-    (env, agents, serializer, embedder,
+    (env, shared_agent, serializer, embedder,
      vector_store, coordinator, hint_parser) = setup(seed)
 
     obs, _ = env.reset(seed=seed)
@@ -306,17 +303,16 @@ def train(seed: int = 42):
     os.makedirs(best_models_dir, exist_ok=True)
 
     def _save_best():
-        for i, agent in enumerate(agents):
-            torch.save(
-                {"actor": agent.actor.state_dict(), "critic": agent.critic.state_dict()},
-                os.path.join(best_models_dir, f"agent_{i}.pt"),
-            )
+        torch.save(
+            {"actor": shared_agent.actor.state_dict(), "critic": shared_agent.critic.state_dict()},
+            os.path.join(best_models_dir, "shared_agent.pt"),
+        )
 
-    device = agents[0].device
+    device = shared_agent.device
     print(
         f"Training start | total_steps={TOTAL_STEPS:,} | "
-        f"M={M} agents | obs_dim={OBS_DIM} | n_actions={N_ACTIONS_PER_DEVICE} | "
-        f"device={device}"
+        f"parameter-sharing MARL | K={K} devices | obs_dim={OBS_DIM} | "
+        f"n_actions={N_ACTIONS_PER_DEVICE} | device={device}"
     )
     t0 = time.time()
 
@@ -325,9 +321,9 @@ def train(seed: int = 42):
         # -----------------------------------------------------------------
         # Step 1: Collect one transition
         # -----------------------------------------------------------------
-        (obs, actions, log_probs, values,
+        (obs, device_actions, device_lps, value,
          base_reward, next_obs,
-         terminated, truncated, info) = collect_experience(env, agents, obs)
+         terminated, truncated, info) = collect_experience(env, shared_agent, obs)
 
         # -----------------------------------------------------------------
         # Step 2: Serialize + embed current state for RAG
@@ -368,9 +364,9 @@ def train(seed: int = 42):
         # Step 6: Append to rollout buffer
         # -----------------------------------------------------------------
         buffer["obs"].append(obs.copy())
-        buffer["actions"].append(actions)
-        buffer["log_probs"].append(log_probs)
-        buffer["values"].append(float(np.mean(values)))
+        buffer["actions"].append(device_actions)   # list of K ints
+        buffer["log_probs"].append(device_lps)     # list of K floats
+        buffer["values"].append(value)             # single float
         buffer["rewards"].append(reward)
 
         # Track metrics
@@ -393,10 +389,9 @@ def train(seed: int = 42):
         if len(buffer["rewards"]) >= BATCH_SIZE:
             with torch.no_grad():
                 next_obs_t = torch.tensor(next_obs, dtype=torch.float32)
-                last_val   = float(np.mean([
-                    agent.critic(next_obs_t.to(agent.device)).item()
-                    for agent in agents
-                ]))
+                last_val   = float(
+                    shared_agent.critic(next_obs_t.to(shared_agent.device)).item()
+                )
 
             returns, advantages = compute_returns_and_advantages(
                 buffer["rewards"], buffer["values"], last_val
@@ -404,7 +399,7 @@ def train(seed: int = 42):
             buffer["returns"]    = returns
             buffer["advantages"] = advantages
 
-            ppo_update(agents, buffer)
+            ppo_update(shared_agent, buffer)
 
             buffer = _empty_buffer()
 
@@ -459,8 +454,7 @@ def train(seed: int = 42):
 
             last_1k = reward_history[-1] if reward_history else ep_reward_accum
 
-            # Trend: compare the most-recent 1 000-step snapshot to the one
-            # 10 snapshots earlier (= 10 000 steps ago) when available.
+            # Trend: compare last 1 000-step snapshot to 10 snapshots earlier
             if len(reward_history) >= 11:
                 delta = reward_history[-1] - reward_history[-11]
                 if delta > 0.05:
@@ -489,7 +483,6 @@ def train(seed: int = 42):
         # if step >= 100_000 and step >= EARLY_STOP_WINDOW * 2 and step % EARLY_STOP_WINDOW == 0:
         #     old_mean = float(np.mean(step_latencies[-2 * EARLY_STOP_WINDOW : -EARLY_STOP_WINDOW]))
         #     new_mean = float(np.mean(step_latencies[-EARLY_STOP_WINDOW:]))
-        #     # Latency decreasing means improvement; check relative change
         #     if old_mean > 0 and (old_mean - new_mean) / old_mean < EARLY_STOP_MIN_IMPV:
         #         print(
         #             f"Early stopping at step {step:,}: latency improvement "
@@ -514,18 +507,17 @@ def train(seed: int = 42):
                 break
 
     # -----------------------------------------------------------------
-    # Save final model checkpoints
+    # Save final model checkpoint
     # -----------------------------------------------------------------
-    for i, agent in enumerate(agents):
-        path = os.path.join(MODELS_DIR, f"agent_{i}.pt")
-        torch.save(
-            {"actor": agent.actor.state_dict(), "critic": agent.critic.state_dict()},
-            path,
-        )
-        print(f"Saved agent {i} → {path}")
+    final_path = os.path.join(MODELS_DIR, "shared_agent.pt")
+    torch.save(
+        {"actor": shared_agent.actor.state_dict(), "critic": shared_agent.critic.state_dict()},
+        final_path,
+    )
+    print(f"Saved shared_agent → {final_path}")
 
     print("Training complete.")
-    return agents
+    return shared_agent
 
 
 # =============================================================================
