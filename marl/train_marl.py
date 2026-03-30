@@ -57,10 +57,10 @@ def _save_checkpoint(shared_agent, step):
 # PPO hyper-parameters (not in config — training-loop internals)
 # -----------------------------------------------------------------------------
 PPO_EPSILON   = 0.2     # clipping range for importance-sampling ratio
-ENTROPY_COEF  = 0.05    # entropy regularisation coefficient
-CRITIC_COEF   = 0.5     # critic loss coefficient
+ENTROPY_COEF  = 0.02    # entropy regularisation coefficient
+CRITIC_COEF   = 0.25    # critic loss coefficient
 PPO_EPOCHS    = 2       # gradient update passes per collected batch
-GAE_LAMBDA    = 0.95    # GAE λ for advantage estimation
+GAE_LAMBDA    = 0.90    # GAE λ for advantage estimation
 GRAD_CLIP     = 0.3     # global gradient-norm clip
 EVAL_INTERVAL = 1_000   # steps between progress log lines
 
@@ -200,7 +200,7 @@ def compute_returns_and_advantages(rewards, values, last_value, gamma=GAMMA, lam
 # 4.  ppo_update()
 # =============================================================================
 
-def ppo_update(shared_agent, buffer):
+def ppo_update(shared_agent, buffer, step: int = 0):
     """
     Run PPO parameter update for the single shared_agent.
 
@@ -217,6 +217,7 @@ def ppo_update(shared_agent, buffer):
         log_probs  : list[list[float]]            — shape (T, K)
         returns    : list[float]                  — length T
         advantages : list[float]                  — length T
+    step : int — current training step, used for grad-norm logging cadence
     """
     T = len(buffer["obs"])
 
@@ -232,6 +233,9 @@ def ppo_update(shared_agent, buffer):
     acts_flat   = np.array(buffer["actions"],   dtype=np.int64).flatten()   # (T*K,)
     old_lp_flat = np.array(buffer["log_probs"], dtype=np.float32).flatten() # (T*K,)
 
+    # Normalise returns for critic stability
+    ret_flat = (ret_flat - ret_flat.mean()) / (ret_flat.std() + 1e-8)
+
     # Normalise advantages over the full T*K batch
     adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
@@ -242,9 +246,23 @@ def ppo_update(shared_agent, buffer):
     ret_t    = torch.tensor(ret_flat,    device=dev)
     adv_t    = torch.tensor(adv_flat,    device=dev)
 
+    # Old values for value clipping (computed once before the update epochs)
+    with torch.no_grad():
+        old_values_t, _, _ = shared_agent.evaluate(obs_t, acts_t)
+        old_values_t = old_values_t.squeeze(-1).detach()       # (T*K,)
+
     for _ in range(PPO_EPOCHS):
         values_t, new_lp_t, entropy = shared_agent.evaluate(obs_t, acts_t)
         values_t = values_t.squeeze(-1)                         # (T*K,)
+
+        # Value clipping: restrict critic update to a PPO_EPSILON neighbourhood
+        values_clipped = old_values_t + torch.clamp(
+            values_t - old_values_t, -PPO_EPSILON, PPO_EPSILON
+        )
+        critic_loss = torch.max(
+            F.mse_loss(values_t,         ret_t),
+            F.mse_loss(values_clipped,   ret_t),
+        )
 
         # Importance-sampling ratio  π_new / π_old
         ratio      = torch.exp(new_lp_t - old_lp_t)
@@ -253,19 +271,20 @@ def ppo_update(shared_agent, buffer):
         # Actor loss: clipped surrogate objective (maximised → negated)
         actor_loss  = -torch.min(ratio * adv_t, clip_ratio * adv_t).mean()
 
-        # Critic loss: mean-squared TD error
-        critic_loss = F.mse_loss(values_t, ret_t)
-
         # Combined loss with entropy bonus to encourage exploration
         loss = actor_loss + CRITIC_COEF * critic_loss - ENTROPY_COEF * entropy
 
         shared_agent.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
+        grad_norm = torch.nn.utils.clip_grad_norm_(
             list(shared_agent.actor.parameters()) + list(shared_agent.critic.parameters()),
             max_norm=GRAD_CLIP,
         )
         shared_agent.optimizer.step()
+
+    # Log grad norm every 10 000 steps to detect divergence early
+    if step % 10_000 == 0:
+        print(f"  [grad_norm] step {step:,} | grad_norm={float(grad_norm):.4f}", flush=True)
 
 
 # =============================================================================
@@ -422,7 +441,7 @@ def train(seed: int = 42):
             buffer["returns"]    = returns
             buffer["advantages"] = advantages
 
-            ppo_update(shared_agent, buffer)
+            ppo_update(shared_agent, buffer, step=step)
 
             buffer = _empty_buffer()
 

@@ -49,7 +49,7 @@ KAPPA              = 1e-27   # Effective switched capacitance coefficient (J/cyc
 # MARL (Multi-Agent Reinforcement Learning)
 # -----------------------------------------------------------------------------
 GAMMA              = 0.99    # Discount factor
-LR                 = 1e-4    # Learning rate (Adam optimizer)
+LR                 = 3e-5    # Learning rate (Adam optimizer)
 BATCH_SIZE         = 256     # Mini-batch size for policy updates
 HIDDEN_DIM         = 256     # Hidden layer dimension for actor/critic networks
 N_COORDINATION     = 10      # LLM coordination interval (steps between LLM queries)
