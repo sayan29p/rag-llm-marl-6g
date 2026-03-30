@@ -447,6 +447,12 @@ def train(seed: int = 42):
                     shared_agent.critic(next_obs_t.to(shared_agent.device)).item()
                 )
 
+            rewards_arr = np.array(buffer["rewards"])
+            if rewards_arr.std() > 1e-8:
+                buffer["rewards"] = (
+                    (rewards_arr - rewards_arr.mean()) / rewards_arr.std()
+                ).tolist()
+
             returns, advantages = compute_returns_and_advantages(
                 buffer["rewards"], buffer["values"], last_val
             )

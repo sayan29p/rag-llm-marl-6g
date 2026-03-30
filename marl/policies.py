@@ -90,6 +90,10 @@ class MAPPOAgent:
         self.actor  = ActorNetwork(obs_dim, n_actions).to(self.device)
         self.critic = CriticNetwork(obs_dim).to(self.device)
 
+        # Small random perturbation to critic's final bias breaks symmetry at init
+        with torch.no_grad():
+            self.critic.net[-1].bias.add_(torch.randn(1, device=self.device) * 0.1)
+
         self.optimizer = torch.optim.Adam(
             list(self.actor.parameters()) + list(self.critic.parameters()),
             lr=LR,
