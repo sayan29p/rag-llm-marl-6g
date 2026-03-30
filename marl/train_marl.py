@@ -57,11 +57,11 @@ def _save_checkpoint(shared_agent, step):
 # PPO hyper-parameters (not in config — training-loop internals)
 # -----------------------------------------------------------------------------
 PPO_EPSILON   = 0.2     # clipping range for importance-sampling ratio
-ENTROPY_COEF  = 0.01    # entropy regularisation coefficient
+ENTROPY_COEF  = 0.05    # entropy regularisation coefficient
 CRITIC_COEF   = 0.5     # critic loss coefficient
-PPO_EPOCHS    = 4       # gradient update passes per collected batch
+PPO_EPOCHS    = 2       # gradient update passes per collected batch
 GAE_LAMBDA    = 0.95    # GAE λ for advantage estimation
-GRAD_CLIP     = 0.5     # global gradient-norm clip
+GRAD_CLIP     = 0.3     # global gradient-norm clip
 EVAL_INTERVAL = 1_000   # steps between progress log lines
 
 # Observation dimension (K=20, M=5):  K*M + 2M + 3K = 100 + 10 + 60 = 170
@@ -281,7 +281,7 @@ def train(seed: int = 42):
     Every BATCH_SIZE steps  : PPO update on shared_agent (T*K transitions).
     Every EVAL_INTERVAL     : print progress metrics.
     """
-    N_COORD = N_COORDINATION  # fires every 10 steps as configured in config.py
+    N_COORD = 999_999  # LLM disabled for now; set to N_COORDINATION to re-enable
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR,  exist_ok=True)
