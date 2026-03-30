@@ -30,6 +30,29 @@ from llm.coordinator import LLMCoordinator
 from llm.hint_parser import HintParser
 from marl.policies import MAPPOAgent
 
+
+def _save_checkpoint(shared_agent, step):
+    import os
+    import torch
+    save_data = {
+        "actor": shared_agent.actor.state_dict(),
+        "critic": shared_agent.critic.state_dict(),
+        "step": step
+    }
+    paths = [
+        os.path.join(MODELS_DIR, "shared_agent.pt"),
+    ]
+    kaggle_path = "/kaggle/working/shared_agent.pt"
+    if os.path.exists("/kaggle/working"):
+        paths.append(kaggle_path)
+    for path in paths:
+        try:
+            os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+            torch.save(save_data, path)
+            print(f"Saved checkpoint step {step} → {path}", flush=True)
+        except Exception as e:
+            print(f"Save failed {path}: {e}", flush=True)
+
 # -----------------------------------------------------------------------------
 # PPO hyper-parameters (not in config — training-loop internals)
 # -----------------------------------------------------------------------------
@@ -445,6 +468,8 @@ def train(seed: int = 42):
             reward_history.append(snapshot)
 
         if step % PROGRESS_INTERVAL == 0:
+            _save_checkpoint(shared_agent, step)
+
             pct     = 100.0 * step / TOTAL_STEPS
             bar_len = 30
             filled  = int(bar_len * step / TOTAL_STEPS)
@@ -509,12 +534,7 @@ def train(seed: int = 42):
     # -----------------------------------------------------------------
     # Save final model checkpoint
     # -----------------------------------------------------------------
-    final_path = os.path.join(MODELS_DIR, "shared_agent.pt")
-    torch.save(
-        {"actor": shared_agent.actor.state_dict(), "critic": shared_agent.critic.state_dict()},
-        final_path,
-    )
-    print(f"Saved shared_agent → {final_path}")
+    _save_checkpoint(shared_agent, TOTAL_STEPS)
 
     print("Training complete.")
     return shared_agent
