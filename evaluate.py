@@ -27,7 +27,7 @@ from marl.policies import MAPPOAgent
 
 EVAL_STEPS = 1_000
 EVAL_SEED  = 0
-OBS_DIM    = K * M + 2 * M + 3 * K   # 170
+OBS_DIM    = K * M + 2 * M + 3 * K + K   # 170 + K = 190 (device-specific obs)
 
 
 # =============================================================================
@@ -69,36 +69,48 @@ def _run_episode(env, action_fn, steps=EVAL_STEPS):
     }
 
 
-def _load_agents(device):
+def _load_shared_agent(device):
     """
-    Load trained MAPPOAgent checkpoints from MODELS_DIR.
-    Returns None if any checkpoint is missing.
+    Load the parameter-sharing MAPPOAgent from models/shared_agent.pt.
+    Returns None if the checkpoint is missing.
     """
-    agents = []
-    for i in range(M):
-        path = os.path.join(MODELS_DIR, f"agent_{i}.pt")
-        if not os.path.exists(path):
-            return None
-        agent = MAPPOAgent(obs_dim=OBS_DIM, n_actions=N_ACTIONS_PER_DEVICE, device=device)
-        ckpt  = torch.load(path, map_location=device)
-        agent.actor.load_state_dict(ckpt["actor"])
-        agent.critic.load_state_dict(ckpt["critic"])
-        agent.actor.eval()
-        agent.critic.eval()
-        agents.append(agent)
-    return agents
+    path = os.path.join(MODELS_DIR, "shared_agent.pt")
+    if not os.path.exists(path):
+        return None
+    agent = MAPPOAgent(obs_dim=OBS_DIM, n_actions=N_ACTIONS_PER_DEVICE, device=device)
+    ckpt  = torch.load(path, map_location=device)
+    agent.actor.load_state_dict(ckpt["actor"])
+    agent.critic.load_state_dict(ckpt["critic"])
+    agent.actor.eval()
+    agent.critic.eval()
+    return agent
 
 
-def _marl_action_fn(agents, device):
-    """Returns an action_fn that queries all M trained agents (no LLM)."""
+_EYE_K_EVAL = np.eye(K, dtype=np.float32)   # (K, K) one-hot matrix
+
+
+def _marl_action_fn(shared_agent):
+    """
+    Returns an action_fn that calls shared_agent K times — once per device —
+    each with a device-specific obs (global obs + one-hot device index).
+    All M edge nodes receive the same K-device action array (parameter sharing).
+    """
+    device = shared_agent.device
+
     def action_fn(obs):
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-        actions = []
+        device_actions = []
         with torch.no_grad():
-            for agent in agents:
-                act, _ = agent.act(obs_t)
-                actions.append(int(act.item()))
-        return tuple(np.full(K, actions[i], dtype=np.int32) for i in range(M))
+            for k in range(K):
+                device_obs = np.concatenate([obs, _EYE_K_EVAL[k]])
+                obs_t      = torch.tensor(device_obs, dtype=torch.float32, device=device)
+                logits     = shared_agent.actor(obs_t)
+                dist       = torch.distributions.Categorical(logits=logits)
+                device_actions.append(int(dist.sample().item()))
+        joint_action = tuple(
+            np.array(device_actions, dtype=np.int32) for _ in range(M)
+        )
+        return joint_action
+
     return action_fn
 
 
@@ -137,15 +149,15 @@ def run_greedy(env):
 
 
 # =============================================================================
-# Baseline 3 — MARL only (trained agents, no LLM)
+# Baseline 3 — MARL only (parameter-sharing shared_agent, greedy eval)
 # =============================================================================
 
 def run_marl_only(env, device):
-    agents = _load_agents(device)
-    if agents is None:
-        print("  [MARL only] No checkpoints found in models/ — skipping.")
+    shared_agent = _load_shared_agent(device)
+    if shared_agent is None:
+        print("  [MARL only] models/shared_agent.pt not found — skipping.")
         return None
-    return _run_episode(env, _marl_action_fn(agents, device))
+    return _run_episode(env, _marl_action_fn(shared_agent))
 
 
 # =============================================================================
@@ -153,57 +165,8 @@ def run_marl_only(env, device):
 # =============================================================================
 
 def run_full_system(env, device):
-    agents = _load_agents(device)
-    if agents is None:
-        print("  [Full system] No checkpoints found in models/ — skipping.")
-        return None
-
-    serializer   = StateSerializer()
-    embedder     = StateEmbedder()
-    vector_store = VectorStore(embedding_dim=EMBEDDING_DIM)
-    coordinator  = LLMCoordinator()
-    hint_parser  = HintParser()
-
-    current_hint = None
-    step_idx     = [0]    # mutable counter inside closure
-
-    # Build a base MARL action fn for execution
-    marl_fn = _marl_action_fn(agents, device)
-
-    def action_fn(obs):
-        step_idx[0] += 1
-
-        # Serialize + embed every step for RAG storage
-        state_text = serializer.serialize(obs)
-        embedding  = embedder.embed(state_text)
-
-        # LLM coordination every N_COORDINATION steps (use 10 here)
-        nonlocal current_hint
-        if step_idx[0] % 10 == 0:
-            if len(vector_store) > 0:
-                results        = vector_store.retrieve(embedding, top_k=RAG_TOP_K)
-                context_string = vector_store.build_context_string(results)
-            else:
-                context_string = "No past situations stored yet."
-            current_hint = coordinator.get_hint(state_text, context_string)
-
-        # Get base MARL action
-        joint_action = marl_fn(obs)
-
-        # Override action for preferred nodes (reward shaping at eval = routing hint)
-        if current_hint and current_hint["preferred_nodes"]:
-            best_node = current_hint["preferred_nodes"][0]   # 1-indexed
-            action    = int(best_node)
-            joint_action = tuple(
-                np.full(K, action, dtype=np.int32) for _ in range(M)
-            )
-
-        # Store in RAG (use 0.0 as placeholder reward — we don't know it yet)
-        vector_store.add(embedding, state_text, 0.0)
-
-        return joint_action
-
-    return _run_episode(env, action_fn)
+    print("  [Full system] LLM training pending — skipping.")
+    return None
 
 
 # =============================================================================

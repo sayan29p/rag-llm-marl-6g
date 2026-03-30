@@ -64,8 +64,9 @@ GAE_LAMBDA    = 0.90    # GAE λ for advantage estimation
 GRAD_CLIP     = 0.3     # global gradient-norm clip
 EVAL_INTERVAL = 1_000   # steps between progress log lines
 
-# Observation dimension (K=20, M=5):  K*M + 2M + 3K = 100 + 10 + 60 = 170
-OBS_DIM = K * M + 2 * M + 3 * K
+# Observation dimension (K=20, M=5):  K*M + 2M + 3K + K = 100 + 10 + 60 + 20 = 190
+# Global obs (170) + one-hot device index (K=20) = 190
+OBS_DIM = K * M + 2 * M + 3 * K + K
 
 
 # =============================================================================
@@ -108,45 +109,57 @@ def setup(seed: int = 42):
 # 2.  collect_experience()
 # =============================================================================
 
+_EYE_K = np.eye(K, dtype=np.float32)   # (K, K) one-hot matrix, built once
+
+
 def collect_experience(env, shared_agent, obs):
     """
     Execute one environment step using the shared policy.
 
-    The shared_agent is called K times — once per IoT device — to produce
-    K independent routing decisions.  All M edge nodes receive the same
-    K-length action array (parameter sharing: one policy for all nodes).
+    Each of the K devices receives a device-specific observation formed by
+    concatenating the global obs (170-dim) with a one-hot encoding of its
+    device index k (K-dim), yielding a 190-dim input unique to each device.
+    This breaks the symmetry that would otherwise cause identical policies.
 
     Parameters
     ----------
     env          : EdgeCloudEnv
     shared_agent : MAPPOAgent
-    obs          : np.ndarray, shape (OBS_DIM,)
+    obs          : np.ndarray, shape (170,)  — global observation
 
     Returns
     -------
-    obs            : np.ndarray  — observation used this step (same as input)
-    device_actions : list[int]   — K sampled actions, one per device
-    device_lps     : list[float] — K log π(a|s) values
-    value          : float       — V(obs) from critic
-    reward         : float       — base environment reward
-    next_obs       : np.ndarray
-    terminated     : bool
-    truncated      : bool
-    info           : dict  {mean_latency, mean_energy, mean_sla_violation, ...}
+    obs              : np.ndarray, shape (170,) — global obs (for serializer/reward shaping)
+    device_obs_list  : list[np.ndarray(190,)]  — per-device augmented obs, length K
+    device_actions   : list[int]               — K sampled actions, one per device
+    device_lps       : list[float]             — K log π(a|s) values
+    value            : float                   — V(s) from critic (device-0 aug obs)
+    reward           : float                   — base environment reward
+    next_obs         : np.ndarray, shape (170,)
+    terminated       : bool
+    truncated        : bool
+    info             : dict  {mean_latency, mean_energy, mean_sla_violation, ...}
     """
-    obs_tensor = torch.tensor(obs, dtype=torch.float32)
-
-    device_actions = []
-    device_lps     = []
+    device_obs_list = []
+    device_actions  = []
+    device_lps      = []
 
     with torch.no_grad():
-        # K independent action samples — one routing decision per IoT device
-        for _ in range(K):
-            a, lp = shared_agent.act(obs_tensor)
+        # K independent action samples — one per IoT device, each with its own obs
+        for k in range(K):
+            device_obs   = np.concatenate([obs, _EYE_K[k]])          # (190,)
+            obs_tensor_k = torch.tensor(device_obs, dtype=torch.float32)
+            a, lp = shared_agent.act(obs_tensor_k)
+            device_obs_list.append(device_obs)
             device_actions.append(int(a.item()))
             device_lps.append(float(lp.item()))
 
-        value = float(shared_agent.critic(obs_tensor.to(shared_agent.device)).item())
+        # Critic evaluated on device-0 augmented obs (representative baseline value)
+        value = float(
+            shared_agent.critic(
+                torch.tensor(device_obs_list[0], dtype=torch.float32).to(shared_agent.device)
+            ).item()
+        )
 
     # All M edge nodes use the same K-device routing decisions (parameter sharing)
     joint_action = tuple(
@@ -155,7 +168,7 @@ def collect_experience(env, shared_agent, obs):
 
     next_obs, reward, terminated, truncated, info = env.step(joint_action)
 
-    return obs, device_actions, device_lps, value, float(reward), next_obs, terminated, truncated, info
+    return obs, device_obs_list, device_actions, device_lps, value, float(reward), next_obs, terminated, truncated, info
 
 
 # =============================================================================
@@ -212,24 +225,24 @@ def ppo_update(shared_agent, buffer, step: int = 0):
     ----------
     shared_agent : MAPPOAgent
     buffer : dict with keys
-        obs        : list[np.ndarray(OBS_DIM,)]   — length T
-        actions    : list[list[int]]              — shape (T, K)
-        log_probs  : list[list[float]]            — shape (T, K)
-        returns    : list[float]                  — length T
-        advantages : list[float]                  — length T
+        obs        : list[list[np.ndarray(OBS_DIM,)]]  — shape (T, K) per-device obs
+        actions    : list[list[int]]                   — shape (T, K)
+        log_probs  : list[list[float]]                 — shape (T, K)
+        returns    : list[float]                       — length T
+        advantages : list[float]                       — length T
     step : int — current training step, used for grad-norm logging cadence
     """
     T = len(buffer["obs"])
 
-    obs_arr = np.array(buffer["obs"], dtype=np.float32)        # (T, OBS_DIM)
-    ret_arr = np.array(buffer["returns"],    dtype=np.float32)  # (T,)
-    adv_arr = np.array(buffer["advantages"], dtype=np.float32)  # (T,)
+    # obs_arr: (T, K, OBS_DIM) — each device has its own augmented observation
+    obs_arr = np.array(buffer["obs"], dtype=np.float32)         # (T, K, OBS_DIM)
+    ret_arr = np.array(buffer["returns"],    dtype=np.float32)   # (T,)
+    adv_arr = np.array(buffer["advantages"], dtype=np.float32)   # (T,)
 
     # Flatten T steps × K devices → T*K effective transitions
-    # Each device in a step shares the same obs, return, and advantage
-    obs_flat    = np.repeat(obs_arr, K, axis=0)                 # (T*K, OBS_DIM)
-    ret_flat    = np.repeat(ret_arr, K)                         # (T*K,)
-    adv_flat    = np.repeat(adv_arr, K)                         # (T*K,)
+    obs_flat    = obs_arr.reshape(T * K, OBS_DIM)               # (T*K, OBS_DIM)
+    ret_flat    = np.repeat(ret_arr, K)                          # (T*K,)
+    adv_flat    = np.repeat(adv_arr, K)                          # (T*K,)
     acts_flat   = np.array(buffer["actions"],   dtype=np.int64).flatten()   # (T*K,)
     old_lp_flat = np.array(buffer["log_probs"], dtype=np.float32).flatten() # (T*K,)
 
@@ -360,7 +373,7 @@ def train(seed: int = 42):
         # -----------------------------------------------------------------
         # Step 1: Collect one transition
         # -----------------------------------------------------------------
-        (obs, device_actions, device_lps, value,
+        (obs, device_obs_list, device_actions, device_lps, value,
          base_reward, next_obs,
          terminated, truncated, info) = collect_experience(env, shared_agent, obs)
 
@@ -402,9 +415,9 @@ def train(seed: int = 42):
         # -----------------------------------------------------------------
         # Step 6: Append to rollout buffer
         # -----------------------------------------------------------------
-        buffer["obs"].append(obs.copy())
-        buffer["actions"].append(device_actions)   # list of K ints
-        buffer["log_probs"].append(device_lps)     # list of K floats
+        buffer["obs"].append(device_obs_list)         # list of K arrays, each (190,)
+        buffer["actions"].append(device_actions)    # list of K ints
+        buffer["log_probs"].append(device_lps)      # list of K floats
         buffer["values"].append(value)             # single float
         buffer["rewards"].append(reward)
 
@@ -427,8 +440,10 @@ def train(seed: int = 42):
         # -----------------------------------------------------------------
         if len(buffer["rewards"]) >= BATCH_SIZE:
             with torch.no_grad():
-                next_obs_t = torch.tensor(next_obs, dtype=torch.float32)
-                last_val   = float(
+                # Bootstrap value: use device-0 one-hot augmented next_obs
+                next_obs_aug = np.concatenate([next_obs, _EYE_K[0]])
+                next_obs_t   = torch.tensor(next_obs_aug, dtype=torch.float32)
+                last_val     = float(
                     shared_agent.critic(next_obs_t.to(shared_agent.device)).item()
                 )
 
