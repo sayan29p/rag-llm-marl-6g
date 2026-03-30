@@ -9,7 +9,6 @@ import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -57,11 +56,11 @@ def _save_checkpoint(shared_agent, step):
 # PPO hyper-parameters (not in config — training-loop internals)
 # -----------------------------------------------------------------------------
 PPO_EPSILON   = 0.2     # clipping range for importance-sampling ratio
-ENTROPY_COEF  = 0.02    # entropy regularisation coefficient
-CRITIC_COEF   = 0.25    # critic loss coefficient
-PPO_EPOCHS    = 2       # gradient update passes per collected batch
-GAE_LAMBDA    = 0.90    # GAE λ for advantage estimation
-GRAD_CLIP     = 0.3     # global gradient-norm clip
+ENTROPY_COEF  = 0.01    # entropy regularisation coefficient
+CRITIC_COEF   = 0.5     # critic loss weight (CleanRL default)
+PPO_EPOCHS    = 4       # gradient update passes per collected batch
+GAE_LAMBDA    = 0.90    # GAE λ for return computation
+GRAD_CLIP     = 0.5     # global gradient-norm clip
 EVAL_INTERVAL = 1_000   # steps between progress log lines
 
 # Observation dimension (K=20, M=5):  K*M + 2M + 3K + K = 100 + 10 + 60 + 20 = 190
@@ -213,88 +212,72 @@ def compute_returns_and_advantages(rewards, values, last_value, gamma=GAMMA, lam
 # 4.  ppo_update()
 # =============================================================================
 
-def ppo_update(shared_agent, buffer, step: int = 0):
+def ppo_update(shared_agent, buffer):
     """
-    Run PPO parameter update for the single shared_agent.
+    CleanRL-style PPO update for the shared_agent.
 
-    Buffer stores K actions and K log_probs per environment step.
-    We flatten to T*K transitions so the shared network is trained on
-    every individual device decision, not just step-level averages.
+    Buffer obs shape (T, K, OBS_DIM) is flattened to (T*K, OBS_DIM).
+    Returns (length T) are repeated K times to align with per-device
+    transitions.  Advantages = returns - critic baseline, normalised.
+    Old log-probs come from the collection phase (importance ratio).
 
     Parameters
     ----------
     shared_agent : MAPPOAgent
     buffer : dict with keys
-        obs        : list[list[np.ndarray(OBS_DIM,)]]  — shape (T, K) per-device obs
-        actions    : list[list[int]]                   — shape (T, K)
-        log_probs  : list[list[float]]                 — shape (T, K)
-        returns    : list[float]                       — length T
-        advantages : list[float]                       — length T
-    step : int — current training step, used for grad-norm logging cadence
+        obs       : list[list[np.ndarray(OBS_DIM,)]]  — shape (T, K)
+        actions   : list[list[int]]                   — shape (T, K)
+        log_probs : list[list[float]]                 — shape (T, K)
+        returns   : list[float]                       — length T
     """
-    T = len(buffer["obs"])
+    obs_b     = torch.tensor(
+        np.array(buffer["obs"], dtype=np.float32),
+        device=shared_agent.device,
+    ).reshape(-1, OBS_DIM)                                          # (T*K, OBS_DIM)
 
-    # obs_arr: (T, K, OBS_DIM) — each device has its own augmented observation
-    obs_arr = np.array(buffer["obs"], dtype=np.float32)         # (T, K, OBS_DIM)
-    ret_arr = np.array(buffer["returns"],    dtype=np.float32)   # (T,)
-    adv_arr = np.array(buffer["advantages"], dtype=np.float32)   # (T,)
+    act_b     = torch.tensor(
+        np.array(buffer["actions"]).flatten(),
+        dtype=torch.int64, device=shared_agent.device,
+    )                                                               # (T*K,)
 
-    # Flatten T steps × K devices → T*K effective transitions
-    obs_flat    = obs_arr.reshape(T * K, OBS_DIM)               # (T*K, OBS_DIM)
-    ret_flat    = np.repeat(ret_arr, K)                          # (T*K,)
-    adv_flat    = np.repeat(adv_arr, K)                          # (T*K,)
-    acts_flat   = np.array(buffer["actions"],   dtype=np.int64).flatten()   # (T*K,)
-    old_lp_flat = np.array(buffer["log_probs"], dtype=np.float32).flatten() # (T*K,)
+    old_lp_b  = torch.tensor(
+        np.array(buffer["log_probs"]).flatten(),
+        dtype=torch.float32, device=shared_agent.device,
+    )                                                               # (T*K,)
 
-    # Normalise advantages over the full T*K batch
-    adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+    ret_b     = torch.tensor(
+        np.repeat(np.array(buffer["returns"]), K),
+        dtype=torch.float32, device=shared_agent.device,
+    )                                                               # (T*K,)
 
-    dev = shared_agent.device
-    obs_t    = torch.tensor(obs_flat,    device=dev)
-    acts_t   = torch.tensor(acts_flat,   device=dev)
-    old_lp_t = torch.tensor(old_lp_flat, device=dev)
-    ret_t    = torch.tensor(ret_flat,    device=dev)
-    adv_t    = torch.tensor(adv_flat,    device=dev)
-
-    # Old values for value clipping (computed once before the update epochs)
+    # Advantage = return − critic baseline (computed once, before update epochs)
     with torch.no_grad():
-        old_values_t, _, _ = shared_agent.evaluate(obs_t, acts_t)
-        old_values_t = old_values_t.squeeze(-1).detach()       # (T*K,)
+        val_b = shared_agent.critic(obs_b).squeeze(-1)             # (T*K,)
+    adv_b = ret_b - val_b
+    adv_b = (adv_b - adv_b.mean()) / (adv_b.std() + 1e-8)
 
     for _ in range(PPO_EPOCHS):
-        values_t, new_lp_t, entropy = shared_agent.evaluate(obs_t, acts_t)
-        values_t = values_t.squeeze(-1)                         # (T*K,)
+        new_val, new_lp_b, entropy = shared_agent.evaluate(obs_b, act_b)
+        new_val = new_val.squeeze(-1)                               # (T*K,)
 
-        # Value clipping: restrict critic update to a PPO_EPSILON neighbourhood
-        values_clipped = old_values_t + torch.clamp(
-            values_t - old_values_t, -PPO_EPSILON, PPO_EPSILON
-        )
-        critic_loss = torch.max(
-            F.mse_loss(values_t,         ret_t),
-            F.mse_loss(values_clipped,   ret_t),
-        )
+        # Clipped surrogate actor loss (CleanRL formulation)
+        ratio    = torch.exp(new_lp_b - old_lp_b)
+        pg_loss1 = -adv_b * ratio
+        pg_loss2 = -adv_b * torch.clamp(ratio, 1.0 - PPO_EPSILON, 1.0 + PPO_EPSILON)
+        pg_loss  = torch.max(pg_loss1, pg_loss2).mean()
 
-        # Importance-sampling ratio  π_new / π_old
-        ratio      = torch.exp(new_lp_t - old_lp_t)
-        clip_ratio = torch.clamp(ratio, 1.0 - PPO_EPSILON, 1.0 + PPO_EPSILON)
+        # Critic MSE loss
+        v_loss = 0.5 * ((new_val - ret_b) ** 2).mean()
 
-        # Actor loss: clipped surrogate objective (maximised → negated)
-        actor_loss  = -torch.min(ratio * adv_t, clip_ratio * adv_t).mean()
-
-        # Combined loss with entropy bonus to encourage exploration
-        loss = actor_loss + CRITIC_COEF * critic_loss - ENTROPY_COEF * entropy
+        loss = pg_loss + CRITIC_COEF * v_loss - ENTROPY_COEF * entropy
 
         shared_agent.optimizer.zero_grad()
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
+        torch.nn.utils.clip_grad_norm_(
             list(shared_agent.actor.parameters()) + list(shared_agent.critic.parameters()),
-            max_norm=GRAD_CLIP,
+            GRAD_CLIP,
         )
         shared_agent.optimizer.step()
-
-    # Log grad norm every 10 000 steps to detect divergence early
-    if step % 10_000 == 0:
-        print(f"  [grad_norm] step {step:,} | grad_norm={float(grad_norm):.4f}", flush=True)
 
 
 # =============================================================================
@@ -415,9 +398,9 @@ def train(seed: int = 42):
         # -----------------------------------------------------------------
         # Step 6: Append to rollout buffer
         # -----------------------------------------------------------------
-        buffer["obs"].append(device_obs_list)         # list of K arrays, each (190,)
-        buffer["actions"].append(device_actions)    # list of K ints
-        buffer["log_probs"].append(device_lps)      # list of K floats
+        buffer["obs"].append(device_obs_list)      # list of K arrays, each (190,)
+        buffer["actions"].append(device_actions)   # list of K ints
+        buffer["log_probs"].append(device_lps)     # list of K floats
         buffer["values"].append(value)             # single float
         buffer["rewards"].append(reward)
 
@@ -453,13 +436,12 @@ def train(seed: int = 42):
                     (rewards_arr - rewards_arr.mean()) / rewards_arr.std()
                 ).tolist()
 
-            returns, advantages = compute_returns_and_advantages(
+            returns, _ = compute_returns_and_advantages(
                 buffer["rewards"], buffer["values"], last_val
             )
-            buffer["returns"]    = returns
-            buffer["advantages"] = advantages
+            buffer["returns"] = returns
 
-            ppo_update(shared_agent, buffer, step=step)
+            ppo_update(shared_agent, buffer)
 
             buffer = _empty_buffer()
 
