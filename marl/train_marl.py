@@ -160,10 +160,8 @@ def collect_experience(env, shared_agent, obs):
             ).item()
         )
 
-    # All M edge nodes use the same K-device routing decisions (parameter sharing)
-    joint_action = tuple(
-        np.array(device_actions, dtype=np.int32) for _ in range(M)
-    )
+    # env.step() only reads actions[0]; pass a single-element tuple
+    joint_action = (np.array(device_actions, dtype=np.int32),)
 
     next_obs, reward, terminated, truncated, info = env.step(joint_action)
 
