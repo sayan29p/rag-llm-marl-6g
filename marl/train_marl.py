@@ -1,6 +1,6 @@
 # =============================================================================
 # RAG-Enhanced LLM-Coordinated MARL for 6G Edge-Cloud Task Offloading
-# Minimal REINFORCE training loop
+# REINFORCE training loop — device-specific 18-dim observations
 # =============================================================================
 
 import os
@@ -9,20 +9,32 @@ import time
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from config import M, K, LR, TOTAL_STEPS, RESULTS_DIR, MODELS_DIR, LOGS_DIR
 from env.edge_cloud_env import EdgeCloudEnv, N_ACTIONS_PER_DEVICE
+from marl.policies import MAPPOAgent
 
 # -----------------------------------------------------------------------------
-# Constants
+# Observation dimensions
 # -----------------------------------------------------------------------------
-OBS_DIM       = K * M + 2 * M + 3 * K   # 170  (global obs, no device augmentation)
-N_ACTIONS     = N_ACTIONS_PER_DEVICE     # 7    (local + 5 edge + cloud)
-BATCH         = 100                       # steps between REINFORCE updates
-HIDDEN_DIM    = 256
+# Per-device 18-dim obs layout:
+#   channel rates to all M servers  obs[k*M : (k+1)*M]              (M=5)
+#   queue lengths                   obs[K*M : K*M+M]                (M=5)
+#   server CPU                      obs[K*M+M : K*M+2*M]            (M=5)
+#   task_data[k]                    obs[K*M+2*M+k]                  (1)
+#   task_cycles[k]                  obs[K*M+2*M+K+k]                (1)
+#   task_deadline[k]                obs[K*M+2*M+2*K+k]              (1)
+#   Total: 5+5+5+1+1+1 = 18
+GLOBAL_OBS_DIM = K * M + 2 * M + 3 * K   # 170  (full env obs, used for slicing)
+OBS_DIM        = M + M + M + 3            # 18   (per-device input to network)
+N_ACTIONS      = N_ACTIONS_PER_DEVICE     # 7
+
+# -----------------------------------------------------------------------------
+# Training hyper-parameters
+# -----------------------------------------------------------------------------
+BATCH         = 256     # steps between REINFORCE updates
 ENTROPY_COEF  = 0.01
 GRAD_CLIP     = 0.5
 EVAL_INTERVAL = 1_000
@@ -30,28 +42,34 @@ PROG_INTERVAL = 10_000
 
 
 # =============================================================================
-# Policy network (actor only)
+# Device obs builder
 # =============================================================================
 
-class Policy(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(OBS_DIM,    HIDDEN_DIM), nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM), nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, N_ACTIONS),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+def _device_obs(obs: np.ndarray, k: int) -> np.ndarray:
+    """
+    Build the 18-dim device-specific observation for device k from the
+    170-dim global observation vector.
+    """
+    return np.concatenate([
+        obs[k * M : (k + 1) * M],                               # channel rates (M,)
+        obs[K * M : K * M + M],                                  # queue lengths (M,)
+        obs[K * M + M : K * M + 2 * M],                         # server CPU    (M,)
+        obs[K * M + 2 * M + k       : K * M + 2 * M + k + 1],   # task_data[k]  (1,)
+        obs[K * M + 2 * M + K + k   : K * M + 2 * M + K + k + 1],   # task_cycles[k] (1,)
+        obs[K * M + 2 * M + 2*K + k : K * M + 2 * M + 2*K + k + 1], # task_deadline[k] (1,)
+    ], dtype=np.float32)   # shape (18,)
 
 
 # =============================================================================
 # Checkpoint saving
 # =============================================================================
 
-def _save_checkpoint(policy: Policy, step: int):
-    data  = {"actor": policy.state_dict(), "step": step}
+def _save_checkpoint(agent: MAPPOAgent, step: int):
+    data  = {
+        "actor" : agent.actor.state_dict(),
+        "critic": agent.critic.state_dict(),
+        "step"  : step,
+    }
     paths = [os.path.join(MODELS_DIR, "shared_agent.pt")]
     if os.path.exists("/kaggle/working"):
         paths.append("/kaggle/working/shared_agent.pt")
@@ -73,15 +91,16 @@ def train(seed: int = 42):
     os.makedirs(MODELS_DIR,  exist_ok=True)
     os.makedirs(LOGS_DIR,    exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    policy = Policy().to(device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=LR)
+    device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    shared_agent = MAPPOAgent(obs_dim=OBS_DIM, n_actions=N_ACTIONS, device=device)
+    optimizer    = torch.optim.Adam(shared_agent.actor.parameters(), lr=LR)
 
     env = EdgeCloudEnv(seed=seed)
     obs, _ = env.reset(seed=seed)
 
     # Rollout buffers — cleared after every REINFORCE update
-    log_probs_buf: list[torch.Tensor] = []
+    log_probs_buf: list[torch.Tensor] = []   # mean log_prob over K devices per step
+    entropies_buf: list[torch.Tensor] = []   # mean entropy  over K devices per step
     rewards_buf:   list[float]        = []
 
     # Metrics
@@ -90,8 +109,8 @@ def train(seed: int = 42):
     step_sla:       list[float] = []
     reward_history: list[float] = []
 
-    best_reward    = -float("inf")
-    best_dir       = os.path.join(MODELS_DIR, "best")
+    best_reward = -float("inf")
+    best_dir    = os.path.join(MODELS_DIR, "best")
     os.makedirs(best_dir, exist_ok=True)
 
     print(
@@ -104,22 +123,32 @@ def train(seed: int = 42):
     for step in range(1, TOTAL_STEPS + 1):
 
         # -----------------------------------------------------------------
-        # Step 1: Sample one action from the policy
+        # Step 1: Each device k gets its own 18-dim obs and samples an action
         # -----------------------------------------------------------------
-        obs_t  = torch.tensor(obs, dtype=torch.float32, device=device)
-        logits = policy(obs_t)                                # (N_ACTIONS,)
-        dist   = torch.distributions.Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
+        device_actions = []
+        step_log_probs = []
+        step_entropies = []
+
+        for k in range(K):
+            dev_obs_t = torch.tensor(
+                _device_obs(obs, k), dtype=torch.float32, device=device
+            )
+            logits  = shared_agent.actor(dev_obs_t)
+            dist    = torch.distributions.Categorical(logits=logits)
+            action  = dist.sample()
+            device_actions.append(int(action.item()))
+            step_log_probs.append(dist.log_prob(action))
+            step_entropies.append(dist.entropy())
 
         # -----------------------------------------------------------------
-        # Step 2: All K devices execute the same action
+        # Step 2: Execute all K device actions; clip reward
         # -----------------------------------------------------------------
-        joint_action = (np.full(K, int(action.item()), dtype=np.int32),)
+        joint_action = (np.array(device_actions, dtype=np.int32),)
         obs, reward, terminated, truncated, info = env.step(joint_action)
         reward = max(reward, -5.0)
 
-        log_probs_buf.append(log_prob)
+        log_probs_buf.append(torch.stack(step_log_probs).mean())
+        entropies_buf.append(torch.stack(step_entropies).mean())
         rewards_buf.append(reward)
 
         step_latencies.append(info["mean_latency"])
@@ -137,18 +166,19 @@ def train(seed: int = 42):
             if r.std() > 1e-8:
                 r = (r - r.mean()) / r.std()
 
-            r_t  = torch.tensor(r, dtype=torch.float32, device=device)
-            lp_t = torch.stack(log_probs_buf)                # (BATCH,)
+            r_t      = torch.tensor(r, dtype=torch.float32, device=device)
+            lp_t     = torch.stack(log_probs_buf)         # (BATCH,)
+            ent_mean = torch.stack(entropies_buf).mean()  # scalar
 
-            entropy = dist.entropy()
-            loss    = -(lp_t * r_t).mean() - ENTROPY_COEF * entropy
+            loss = -(lp_t * r_t).mean() - ENTROPY_COEF * ent_mean
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), GRAD_CLIP)
+            torch.nn.utils.clip_grad_norm_(shared_agent.actor.parameters(), GRAD_CLIP)
             optimizer.step()
 
             log_probs_buf = []
+            entropies_buf = []
             rewards_buf   = []
 
         # -----------------------------------------------------------------
@@ -156,8 +186,7 @@ def train(seed: int = 42):
         # -----------------------------------------------------------------
         if step % EVAL_INTERVAL == 0:
             win = slice(-EVAL_INTERVAL, None)
-            # mean_step_reward: average of the raw rewards in the last 1000 steps
-            recent_r = rewards_buf if rewards_buf else [reward]
+            recent_r         = rewards_buf if rewards_buf else [reward]
             mean_step_reward = float(np.mean(recent_r[-EVAL_INTERVAL:]))
             print(
                 f"step {step:>8,} | "
@@ -179,7 +208,8 @@ def train(seed: int = 42):
             if -snapshot > best_reward:
                 best_reward = -snapshot
                 torch.save(
-                    {"actor": policy.state_dict()},
+                    {"actor": shared_agent.actor.state_dict(),
+                     "critic": shared_agent.critic.state_dict()},
                     os.path.join(best_dir, "shared_agent.pt"),
                 )
 
@@ -187,7 +217,7 @@ def train(seed: int = 42):
         # Step 6: Checkpoint + progress bar every PROG_INTERVAL steps
         # -----------------------------------------------------------------
         if step % PROG_INTERVAL == 0:
-            _save_checkpoint(policy, step)
+            _save_checkpoint(shared_agent, step)
 
             pct     = 100.0 * step / TOTAL_STEPS
             filled  = int(30 * step / TOTAL_STEPS)
@@ -213,9 +243,9 @@ def train(seed: int = 42):
     # -----------------------------------------------------------------
     # Final checkpoint
     # -----------------------------------------------------------------
-    _save_checkpoint(policy, TOTAL_STEPS)
+    _save_checkpoint(shared_agent, TOTAL_STEPS)
     print("Training complete.")
-    return policy
+    return shared_agent
 
 
 # =============================================================================
