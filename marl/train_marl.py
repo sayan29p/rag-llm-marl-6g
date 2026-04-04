@@ -1,251 +1,180 @@
 # =============================================================================
 # RAG-Enhanced LLM-Coordinated MARL for 6G Edge-Cloud Task Offloading
-# REINFORCE training loop — device-specific 18-dim observations
+# RLlib PPO training — 170-dim observation, Discrete(7) action
+#
+# Install dependency before running:
+#   pip install "ray[rllib]==2.9.0"
 # =============================================================================
 
 import os
 import sys
-import time
 
 import numpy as np
-import torch
+import gymnasium as gym
+from gymnasium import spaces
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from config import M, K, LR, TOTAL_STEPS, RESULTS_DIR, MODELS_DIR, LOGS_DIR
+from config import M, K, RESULTS_DIR, MODELS_DIR, LOGS_DIR
 from env.edge_cloud_env import EdgeCloudEnv, N_ACTIONS_PER_DEVICE
-from marl.policies import MAPPOAgent
 
-# -----------------------------------------------------------------------------
-# Observation dimensions
-# -----------------------------------------------------------------------------
-# Per-device 18-dim obs layout:
-#   channel rates to all M servers  obs[k*M : (k+1)*M]              (M=5)
-#   queue lengths                   obs[K*M : K*M+M]                (M=5)
-#   server CPU                      obs[K*M+M : K*M+2*M]            (M=5)
-#   task_data[k]                    obs[K*M+2*M+k]                  (1)
-#   task_cycles[k]                  obs[K*M+2*M+K+k]                (1)
-#   task_deadline[k]                obs[K*M+2*M+2*K+k]              (1)
-#   Total: 5+5+5+1+1+1 = 18
-GLOBAL_OBS_DIM = K * M + 2 * M + 3 * K   # 170  (full env obs, used for slicing)
-OBS_DIM        = M + M + M + 3            # 18   (per-device input to network)
-N_ACTIONS      = N_ACTIONS_PER_DEVICE     # 7
-
-# -----------------------------------------------------------------------------
-# Training hyper-parameters
-# -----------------------------------------------------------------------------
-BATCH         = 256     # steps between REINFORCE updates
-ENTROPY_COEF  = 0.01
-GRAD_CLIP     = 0.5
-EVAL_INTERVAL = 1_000
-PROG_INTERVAL = 10_000
+# ---------------------------------------------------------------------------
+# Dimensions
+# ---------------------------------------------------------------------------
+OBS_DIM   = K * M + 2 * M + 3 * K   # 170
+N_ACTIONS = N_ACTIONS_PER_DEVICE     # 7  (local + M edge nodes + cloud)
 
 
 # =============================================================================
-# Device obs builder
+# Single-agent wrapper
+#
+# The underlying EdgeCloudEnv expects actions as a tuple (agent0_actions, ...)
+# where agent0_actions is a shape-(K,) array.  We expose a simpler Discrete(7)
+# space and broadcast the single chosen action to all K devices.
 # =============================================================================
 
-def _device_obs(obs: np.ndarray, k: int) -> np.ndarray:
+class EdgeCloudRLlibEnv(gym.Env):
     """
-    Build the 18-dim device-specific observation for device k from the
-    170-dim global observation vector.
+    Single-agent RLlib-compatible wrapper around EdgeCloudEnv.
+
+    observation_space : Box(170,)    — full environment state vector
+    action_space      : Discrete(7)  — one destination applied to all K devices
+                         0         → local execution
+                         1 … M     → offload to edge node m
+                         M+1       → offload to cloud
     """
-    return np.concatenate([
-        obs[k * M : (k + 1) * M],                               # channel rates (M,)
-        obs[K * M : K * M + M],                                  # queue lengths (M,)
-        obs[K * M + M : K * M + 2 * M],                         # server CPU    (M,)
-        obs[K * M + 2 * M + k       : K * M + 2 * M + k + 1],   # task_data[k]  (1,)
-        obs[K * M + 2 * M + K + k   : K * M + 2 * M + K + k + 1],   # task_cycles[k] (1,)
-        obs[K * M + 2 * M + 2*K + k : K * M + 2 * M + 2*K + k + 1], # task_deadline[k] (1,)
-    ], dtype=np.float32)   # shape (18,)
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, env_config: dict = None):
+        super().__init__()
+        env_config = env_config or {}
+        self._env = EdgeCloudEnv(seed=env_config.get("seed", None))
+
+        self.observation_space = spaces.Box(
+            low=0.0, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(N_ACTIONS)
+
+    def reset(self, *, seed=None, options=None):
+        return self._env.reset(seed=seed, options=options)
+
+    def step(self, action: int):
+        # Broadcast single action to all K devices
+        device_actions = np.full(K, int(action), dtype=np.int32)
+        joint_action   = (device_actions,)
+        obs, reward, terminated, truncated, info = self._env.step(joint_action)
+        return obs, reward, terminated, truncated, info
+
+    def render(self):
+        pass
 
 
 # =============================================================================
-# Checkpoint saving
+# Training
 # =============================================================================
 
-def _save_checkpoint(agent: MAPPOAgent, step: int):
-    data  = {
-        "actor" : agent.actor.state_dict(),
-        "critic": agent.critic.state_dict(),
-        "step"  : step,
-    }
-    paths = [os.path.join(MODELS_DIR, "shared_agent.pt")]
-    if os.path.exists("/kaggle/working"):
-        paths.append("/kaggle/working/shared_agent.pt")
-    for path in paths:
-        try:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            torch.save(data, path)
-            print(f"Saved checkpoint step {step} -> {path}", flush=True)
-        except Exception as e:
-            print(f"Save failed {path}: {e}", flush=True)
+def train(num_iterations: int = 200, seed: int = 42):
+    """
+    Train a PPO agent using RLlib.
 
+    Parameters
+    ----------
+    num_iterations : int
+        Number of RLlib training iterations.  Each iteration collects
+        train_batch_size=2000 environment steps before an SGD update.
+    seed : int
+        Random seed passed to the environment.
+    """
+    # Lazy import so the module is importable even without ray installed
+    try:
+        import ray
+        from ray.rllib.algorithms.ppo import PPOConfig
+    except ImportError as exc:
+        raise ImportError(
+            'ray[rllib] is required. Install with:\n'
+            '  pip install "ray[rllib]==2.9.0"'
+        ) from exc
 
-# =============================================================================
-# Training loop
-# =============================================================================
-
-def train(seed: int = 42):
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR,  exist_ok=True)
     os.makedirs(LOGS_DIR,    exist_ok=True)
 
-    device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    shared_agent = MAPPOAgent(obs_dim=OBS_DIM, n_actions=N_ACTIONS, device=device)
-    optimizer    = torch.optim.Adam(shared_agent.actor.parameters(), lr=LR)
+    ray.init(ignore_reinit_error=True)
 
-    env = EdgeCloudEnv(seed=seed)
-    obs, _ = env.reset(seed=seed)
+    config = (
+        PPOConfig()
+        .environment(
+            EdgeCloudRLlibEnv,
+            env_config={"seed": seed},
+        )
+        .framework("torch")
+        .training(
+            model={
+                "fcnet_hiddens": [256, 256],
+                "fcnet_activation": "relu",
+            },
+            lr=3e-4,
+            num_sgd_iter=4,
+            train_batch_size=2000,
+            # Standard PPO clip and entropy settings
+            clip_param=0.2,
+            entropy_coeff=0.01,
+            vf_loss_coeff=0.5,
+        )
+        .rollouts(
+            num_rollout_workers=0,   # run rollouts on the driver process
+            rollout_fragment_length="auto",
+        )
+        .resources(num_gpus=0)
+        .debugging(seed=seed)
+    )
 
-    # Rollout buffers — cleared after every REINFORCE update
-    log_probs_buf: list[torch.Tensor] = []   # mean log_prob over K devices per step
-    entropies_buf: list[torch.Tensor] = []   # mean entropy  over K devices per step
-    rewards_buf:   list[float]        = []
+    algo = config.build()
 
-    # Metrics
-    step_latencies: list[float] = []
-    step_energies:  list[float] = []
-    step_sla:       list[float] = []
-    reward_history: list[float] = []
-
-    best_reward = -float("inf")
-    best_dir    = os.path.join(MODELS_DIR, "best")
+    best_mean_reward = -float("inf")
+    best_dir         = os.path.join(MODELS_DIR, "best")
     os.makedirs(best_dir, exist_ok=True)
 
     print(
-        f"Training start | total_steps={TOTAL_STEPS:,} | "
-        f"obs_dim={OBS_DIM} | n_actions={N_ACTIONS} | "
-        f"batch={BATCH} | device={device}"
+        f"RLlib PPO | obs_dim={OBS_DIM} | n_actions={N_ACTIONS} | "
+        f"train_batch_size=2000 | num_sgd_iter=4 | lr=3e-4"
     )
-    t0 = time.time()
 
-    for step in range(1, TOTAL_STEPS + 1):
+    for i in range(1, num_iterations + 1):
+        result = algo.train()
 
-        # -----------------------------------------------------------------
-        # Step 1: Each device k gets its own 18-dim obs and samples an action
-        # -----------------------------------------------------------------
-        device_actions = []
-        step_log_probs = []
-        step_entropies = []
+        mean_reward  = result["episode_reward_mean"]
+        total_steps  = result["timesteps_total"]
+        episodes     = result.get("episodes_total", "?")
 
-        for k in range(K):
-            dev_obs_t = torch.tensor(
-                _device_obs(obs, k), dtype=torch.float32, device=device
-            )
-            logits  = shared_agent.actor(dev_obs_t)
-            dist    = torch.distributions.Categorical(logits=logits)
-            action  = dist.sample()
-            device_actions.append(int(action.item()))
-            step_log_probs.append(dist.log_prob(action))
-            step_entropies.append(dist.entropy())
+        print(
+            f"iter {i:>4}/{num_iterations} | "
+            f"steps {total_steps:>9,} | "
+            f"episodes {episodes} | "
+            f"mean_reward {mean_reward:+.4f}",
+            flush=True,
+        )
 
-        # -----------------------------------------------------------------
-        # Step 2: Execute all K device actions; clip reward
-        # -----------------------------------------------------------------
-        joint_action = (np.array(device_actions, dtype=np.int32),)
-        obs, reward, terminated, truncated, info = env.step(joint_action)
-        reward = max(reward, -5.0)
+        # Save best checkpoint
+        if mean_reward > best_mean_reward:
+            best_mean_reward = mean_reward
+            ckpt_path = algo.save(best_dir)
+            print(f"  → new best ({mean_reward:+.4f})  checkpoint: {ckpt_path}", flush=True)
 
-        log_probs_buf.append(torch.stack(step_log_probs).mean())
-        entropies_buf.append(torch.stack(step_entropies).mean())
-        rewards_buf.append(reward)
+        # Periodic checkpoint every 20 iterations
+        if i % 20 == 0:
+            ckpt_path = algo.save(os.path.join(MODELS_DIR, f"ckpt_iter{i:04d}"))
+            print(f"  → checkpoint: {ckpt_path}", flush=True)
 
-        step_latencies.append(info["mean_latency"])
-        step_energies.append(info["mean_energy"])
-        step_sla.append(info["mean_sla_violation"])
-
-        if terminated or truncated:
-            obs, _ = env.reset()
-
-        # -----------------------------------------------------------------
-        # Step 3: REINFORCE update every BATCH steps
-        # -----------------------------------------------------------------
-        if len(rewards_buf) >= BATCH:
-            r = np.array(rewards_buf, dtype=np.float32)
-            if r.std() > 1e-8:
-                r = (r - r.mean()) / r.std()
-
-            r_t      = torch.tensor(r, dtype=torch.float32, device=device)
-            lp_t     = torch.stack(log_probs_buf)         # (BATCH,)
-            ent_mean = torch.stack(entropies_buf).mean()  # scalar
-
-            loss = -(lp_t * r_t).mean() - ENTROPY_COEF * ent_mean
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(shared_agent.actor.parameters(), GRAD_CLIP)
-            optimizer.step()
-
-            log_probs_buf = []
-            entropies_buf = []
-            rewards_buf   = []
-
-        # -----------------------------------------------------------------
-        # Step 4: Progress logging every EVAL_INTERVAL steps
-        # -----------------------------------------------------------------
-        if step % EVAL_INTERVAL == 0:
-            win = slice(-EVAL_INTERVAL, None)
-            recent_r         = rewards_buf if rewards_buf else [reward]
-            mean_step_reward = float(np.mean(recent_r[-EVAL_INTERVAL:]))
-            print(
-                f"step {step:>8,} | "
-                f"mean_step_reward {mean_step_reward:+.4f} | "
-                f"latency {np.mean(step_latencies[win]):.4f}s | "
-                f"energy {np.mean(step_energies[win]):.4e}J | "
-                f"SLA viol {np.mean(step_sla[win]):.4f}s | "
-                f"elapsed {time.time() - t0:.0f}s",
-                flush=True,
-            )
-
-        # -----------------------------------------------------------------
-        # Step 5: Snapshot + best-model every 1000 steps
-        # -----------------------------------------------------------------
-        if step % 1_000 == 0:
-            snapshot = float(np.mean(step_latencies[-1_000:]))
-            reward_history.append(snapshot)
-
-            if -snapshot > best_reward:
-                best_reward = -snapshot
-                torch.save(
-                    {"actor": shared_agent.actor.state_dict(),
-                     "critic": shared_agent.critic.state_dict()},
-                    os.path.join(best_dir, "shared_agent.pt"),
-                )
-
-        # -----------------------------------------------------------------
-        # Step 6: Checkpoint + progress bar every PROG_INTERVAL steps
-        # -----------------------------------------------------------------
-        if step % PROG_INTERVAL == 0:
-            _save_checkpoint(shared_agent, step)
-
-            pct     = 100.0 * step / TOTAL_STEPS
-            filled  = int(30 * step / TOTAL_STEPS)
-            bar     = "#" * filled + "." * (30 - filled)
-            elapsed = time.time() - t0
-            eta     = (elapsed / step) * (TOTAL_STEPS - step)
-
-            last_1k = reward_history[-1] if reward_history else 0.0
-            if len(reward_history) >= 11:
-                delta = reward_history[-1] - reward_history[-11]
-                trend = "IMPROVING" if delta < -0.005 else ("DEGRADING" if delta > 0.005 else "STABLE")
-            else:
-                trend = "STABLE"
-
-            print(f"[{bar}] {pct:5.1f}%  step {step:,}/{TOTAL_STEPS:,}  ETA {eta/60:.1f}min")
-            print(
-                f"Progress: {pct:.0f}% | "
-                f"Best latency: {-best_reward:.4f}s | "
-                f"Last 1k mean latency: {last_1k:.4f}s | "
-                f"Trend: {trend}"
-            )
-
-    # -----------------------------------------------------------------
     # Final checkpoint
-    # -----------------------------------------------------------------
-    _save_checkpoint(shared_agent, TOTAL_STEPS)
-    print("Training complete.")
-    return shared_agent
+    final_path = algo.save(MODELS_DIR)
+    print(f"Training complete. Final checkpoint: {final_path}")
+
+    algo.stop()
+    ray.shutdown()
+
+    return algo
 
 
 # =============================================================================
